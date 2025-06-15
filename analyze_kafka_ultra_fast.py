@@ -204,6 +204,7 @@ class UltraFastKafkaProcessor:
         try:
             event = trade_data.get('event', {})
             if not event:
+                logging.warning("[KAFKA_ULTRA] 收到空的交易數據")
                 return
             
             # 提取基本信息
@@ -216,6 +217,8 @@ class UltraFastKafkaProcessor:
             timestamp = int(event.get('time', 0))
             if timestamp > 1e12:
                 timestamp = int(timestamp / 1000)
+            
+            logging.info(f"[KAFKA_ULTRA] 開始處理交易: {wallet_address} {token_address} {side} {amount} @ {timestamp}")
             
             # 使用 Redis 緩存計算持倉
             position_key = self.POSITION_KEY.format(chain, wallet_address, token_address)
@@ -294,24 +297,19 @@ class UltraFastKafkaProcessor:
             # 更新統計數據
             if transaction_type in ["build", "buy"]:
                 # 買入邏輯
-                if transaction_type == "build":
+                if float(stats['total_amount']) <= 1e-9:  # 剛建倉
                     stats['position_opened_at'] = timestamp
-                
-                # 更新總持倉量和成本
                 stats['total_amount'] = float(stats['total_amount']) + amount
                 stats['total_cost'] = float(stats['total_cost']) + (amount * price)
-                
                 # 更新歷史買入數據
                 stats['historical_total_buy_amount'] += amount
                 stats['historical_total_buy_cost'] += (amount * price)
                 stats['historical_avg_buy_price'] = stats['historical_total_buy_cost'] / stats['historical_total_buy_amount']
-                
                 # 更新平均買入價格
                 stats['avg_buy_price'] = stats['total_cost'] / stats['total_amount'] if stats['total_amount'] > 0 else 0
-                
                 # 更新計數器
                 stats['total_buy_count'] += 1
-                
+                # 減倉但未清倉，不動 total_holding_seconds
             else:  # sell or clean
                 # 計算賣出收益
                 avg_cost = stats['avg_buy_price']
@@ -319,10 +317,12 @@ class UltraFastKafkaProcessor:
                 if avg_cost != 0:
                     realized_profit_percentage = ((price / avg_cost - 1) * 100)
                     realized_profit_percentage = max(realized_profit_percentage, -100)  # 限制最小值為-100%
-                
                 # 更新總持倉量和成本
                 stats['total_amount'] = float(stats['total_amount']) - amount
-                if stats['total_amount'] <= 0:
+                if stats['total_amount'] <= 1e-9:  # 清倉
+                    # 清倉時累加本輪持倉時長
+                    if stats['position_opened_at'] > 0:
+                        stats['total_holding_seconds'] += max(0, timestamp - stats['position_opened_at'])
                     # 清倉時重置成本和均價
                     stats['total_cost'] = 0
                     stats['avg_buy_price'] = 0
@@ -331,26 +331,19 @@ class UltraFastKafkaProcessor:
                     # 減倉時按比例減少成本
                     cost_ratio = amount / (stats['total_amount'] + amount)
                     stats['total_cost'] *= (1 - cost_ratio)
-                
                 # 更新歷史賣出數據
                 stats['historical_total_sell_amount'] += amount
                 stats['historical_total_sell_value'] += (amount * price)
                 if stats['historical_total_sell_amount'] > 0:
                     stats['historical_avg_sell_price'] = stats['historical_total_sell_value'] / stats['historical_total_sell_amount']
-                
                 # 更新已實現收益
                 stats['realized_profit'] += realized_profit
                 stats['realized_profit_percentage'] += realized_profit_percentage
-                
                 # 更新計數器
                 stats['total_sell_count'] += 1
-            
             # 更新最後交易時間
             stats['last_transaction_time'] = timestamp
-            
-            # 更新持倉時長
-            if stats['position_opened_at'] > 0:
-                stats['total_holding_seconds'] = timestamp - stats['position_opened_at']
+            # 不要在每次交易都更新 total_holding_seconds，只在清倉時累加
             
             # 保存到 Redis
             redis_stats = {k: str(v) for k, v in stats.items()}
@@ -359,7 +352,10 @@ class UltraFastKafkaProcessor:
             # 緩存到本地 buffer
             with self.buffer_lock:
                 self.wallet_buy_data_buffer.append((wallet_address, token_address, chain, stats.copy()))
-                if len(self.wallet_buy_data_buffer) >= self.batch_size or (time.time() - self.last_flush_time) > self.flush_interval:
+                buffer_size = len(self.wallet_buy_data_buffer)
+                logging.info(f"[KAFKA_ULTRA] 當前 buffer 大小: {buffer_size}")
+                if buffer_size >= self.batch_size or (time.time() - self.last_flush_time) > self.flush_interval:
+                    logging.info(f"[KAFKA_ULTRA] 觸發 buffer 刷新，大小: {buffer_size}")
                     self._async_flush_wallet_buy_data()
             
             # 構建交易記錄
@@ -381,9 +377,14 @@ class UltraFastKafkaProcessor:
             # 添加到寫入隊列
             self.add_to_queue(tx_data)
             
+            # 添加日誌
+            logging.info(f"[KAFKA_ULTRA] 收到交易: {event.get('address')} {event.get('tokenAddress')} {event.get('side')} {event.get('txnValue')} @ {event.get('time')}")
+            
         except Exception as e:
-            logging.error(f"處理交易異常: {str(e)}")
-            logging.error(f"錯誤詳情: {traceback.format_exc()}")
+            logging.error(f"[KAFKA_ULTRA] 處理交易異常: {str(e)}")
+            logging.error(f"[KAFKA_ULTRA] 錯誤詳情: {traceback.format_exc()}")
+            # 不要讓異常中斷處理流程
+            return
     
     def _determine_transaction_type_fast(self, wallet_address, token_address, chain, side, amount):
         """快速判斷交易類型"""
@@ -423,7 +424,7 @@ class UltraFastKafkaProcessor:
         """批量處理數據"""
         if not batch:
             return
-        
+        logging.info(f"[KAFKA_ULTRA] 批量處理 {len(batch)} 筆交易")
         retry_count = 0
         while retry_count < self.max_retries:
             try:
@@ -431,19 +432,19 @@ class UltraFastKafkaProcessor:
                 with engine.connect() as conn:
                     # 更新統計數據
                     self._update_stats_ultra_fast(conn, batch)
-                    
                 self.last_flush_time = time.time()
                 break
             except Exception as e:
                 retry_count += 1
                 if retry_count == self.max_retries:
-                    logging.error(f"批量處理失敗: {str(e)}")
+                    logging.error(f"批量處理失敗: {str(e)}，本批內容: {batch}")
                 else:
                     time.sleep(self.retry_delay * retry_count)
     
     def _update_stats_ultra_fast(self, conn, transactions):
         """更新統計數據"""
         try:
+            logging.info(f"[KAFKA_ULTRA] _update_stats_ultra_fast 處理 {len(transactions)} 筆交易")
             # 按錢包和代幣分組
             grouped_txs = defaultdict(list)
             for tx in transactions:
@@ -584,7 +585,7 @@ class UltraFastKafkaProcessor:
                 conn.commit()
                 
         except Exception as e:
-            logging.error(f"更新統計失敗: {str(e)}")
+            logging.error(f"更新統計失敗: {str(e)}，本批內容: {transactions}")
             logging.error(f"錯誤詳情: {traceback.format_exc()}")
             raise
     
@@ -620,14 +621,26 @@ class UltraFastKafkaProcessor:
             time.sleep(self.lock_ttl // 2)
 
     def _async_flush_wallet_buy_data(self):
-        with self.buffer_lock:
-            buffer_copy = self.wallet_buy_data_buffer.copy()
-            self.wallet_buy_data_buffer.clear()
-            self.last_flush_time = time.time()
-        self.executor.submit(self._flush_wallet_buy_data, buffer_copy)
+        try:
+            with self.buffer_lock:
+                if not self.wallet_buy_data_buffer:
+                    logging.info("[KAFKA_ULTRA] buffer 為空，跳過刷新")
+                    return
+                buffer_copy = self.wallet_buy_data_buffer.copy()
+                self.wallet_buy_data_buffer.clear()
+                self.last_flush_time = time.time()
+                logging.info(f"[KAFKA_ULTRA] 準備刷新 {len(buffer_copy)} 筆數據")
+            self.executor.submit(self._flush_wallet_buy_data, buffer_copy)
+        except Exception as e:
+            logging.error(f"[KAFKA_ULTRA] 異步刷新異常: {str(e)}")
+            logging.error(f"[KAFKA_ULTRA] 錯誤詳情: {traceback.format_exc()}")
+            # 如果異步刷新失敗，將數據放回 buffer
+            with self.buffer_lock:
+                self.wallet_buy_data_buffer.extend(buffer_copy)
 
     def _flush_wallet_buy_data(self, buffer_copy):
         try:
+            logging.info(f"[KAFKA_ULTRA] _flush_wallet_buy_data 處理 {len(buffer_copy)} 筆交易")
             # 分組，僅保留每個 (wallet, token, chain) 最後一筆
             latest_stats = {}
             for wallet, token, chain, stats in buffer_copy:
@@ -722,7 +735,7 @@ class UltraFastKafkaProcessor:
                 conn.commit()
                 
         except Exception as e:
-            logging.error(f"wallet_buy_data 批量寫入失敗: {str(e)}")
+            logging.error(f"wallet_buy_data 批量寫入失敗: {str(e)}，本批內容: {buffer_copy}")
             logging.error(f"錯誤詳情: {traceback.format_exc()}")
 
 def ultra_fast_kafka_consumer():

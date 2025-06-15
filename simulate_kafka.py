@@ -32,21 +32,25 @@ user_list = [
     "userJ000000000000000000000000000000000000000"
 ]
 
-# 生成過去7天的時間戳
-def get_random_timestamp():
-    now = datetime.now()
-    days_ago = random.randint(0, 7)
-    random_time = now - timedelta(days=days_ago, 
-                                hours=random.randint(0, 23),
-                                minutes=random.randint(0, 59),
-                                seconds=random.randint(0, 59))
-    return int(random_time.timestamp())
+# 生成每個 (user, token) 的最新時間戳
+latest_timestamp = {}
+def get_ordered_timestamp(user, token):
+    key = (user, token)
+    now = int(time.time())
+    if key not in latest_timestamp:
+        # 初始給一個隨機過去7天的時間
+        days_ago = random.randint(0, 7)
+        random_time = datetime.now() - timedelta(days=days_ago, hours=random.randint(0, 23), minutes=random.randint(0, 59), seconds=random.randint(0, 59))
+        latest_timestamp[key] = int(random_time.timestamp())
+    else:
+        latest_timestamp[key] += 1  # 每次自增1秒
+    return latest_timestamp[key]
 
 def random_event():
-    timestamp = get_random_timestamp()
-    is_buy = random.choice([True, False])
-    token_address = random.choice(token_list)
     user = random.choice(user_list)
+    token_address = random.choice(token_list)
+    timestamp = get_ordered_timestamp(user, token_address)
+    is_buy = random.choice([True, False])
     tx_hash = uuid.uuid4().hex
     base_mint = token_address
     quote_mint = random.choice([t for t in token_list if t != token_address])
